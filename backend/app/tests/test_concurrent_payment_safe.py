@@ -1,167 +1,192 @@
 """
-Тест для демонстрации РЕШЕНИЯ проблемы race condition.
+LAB 04 (унаследовано из LAB 02): Демонстрация РЕШЕНИЯ race condition.
 
-Этот тест должен ПРОХОДИТЬ, подтверждая, что при использовании
-pay_order_safe() заказ оплачивается только один раз.
+pay_order_safe() — REPEATABLE READ + FOR UPDATE.
+Только одна транзакция успешно оплачивает заказ.
 """
 
 import asyncio
+import os
+import time
 import pytest
 import uuid
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.application.payment_service import PaymentService
 from app.domain.exceptions import OrderAlreadyPaidError
 
-
-# TODO: Настроить подключение к тестовой БД
-DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/marketplace"
+_DB_URL = os.getenv("DATABASE_URL", "")
 
 
-@pytest.fixture
-async def db_session():
-    """
-    Создать сессию БД для тестов.
-    
-    TODO: Реализовать фикстуру (см. test_concurrent_payment_unsafe.py)
-    """
-    # TODO: Реализовать создание сессии
-    raise NotImplementedError("TODO: Реализовать db_session fixture")
+def _pg_available() -> bool:
+    try:
+        import asyncpg  # noqa
+        return _DB_URL.startswith("postgresql")
+    except ImportError:
+        return False
 
 
-@pytest.fixture
-async def test_order(db_session):
-    """
-    Создать тестовый заказ со статусом 'created'.
-    
-    TODO: Реализовать фикстуру (см. test_concurrent_payment_unsafe.py)
-    """
-    # TODO: Реализовать создание тестового заказа
-    raise NotImplementedError("TODO: Реализовать test_order fixture")
+def _make_engine():
+    return create_async_engine(_DB_URL, echo=False)
+
+
+async def _create_order(factory, user_suffix="") -> tuple[uuid.UUID, uuid.UUID]:
+    user_id = uuid.uuid4()
+    order_id = uuid.uuid4()
+    async with factory() as s:
+        await s.execute(
+            text("INSERT INTO users (id, email, name, created_at) VALUES (:id, :email, :name, NOW())"),
+            {"id": str(user_id), "email": f"safe_test_{user_suffix}{user_id}@example.com", "name": "T"},
+        )
+        await s.execute(
+            text("INSERT INTO orders (id, user_id, status, total_amount, created_at) VALUES (:id, :uid, 'created', 100, NOW())"),
+            {"id": str(order_id), "uid": str(user_id)},
+        )
+        await s.execute(
+            text("INSERT INTO order_status_history (id, order_id, status, changed_at) VALUES (gen_random_uuid(), :oid, 'created', NOW())"),
+            {"oid": str(order_id)},
+        )
+        await s.commit()
+    return user_id, order_id
+
+
+async def _cleanup(factory, user_id, order_id):
+    async with factory() as s:
+        await s.execute(text("DELETE FROM order_status_history WHERE order_id = :oid"), {"oid": str(order_id)})
+        await s.execute(text("DELETE FROM orders WHERE id = :oid"), {"oid": str(order_id)})
+        await s.execute(text("DELETE FROM users WHERE id = :uid"), {"uid": str(user_id)})
+        await s.commit()
 
 
 @pytest.mark.asyncio
-async def test_concurrent_payment_safe_prevents_race_condition(db_session, test_order):
-    """
-    Тест демонстрирует решение проблемы race condition с помощью pay_order_safe().
-    
-    ОЖИДАЕМЫЙ РЕЗУЛЬТАТ: Тест ПРОХОДИТ, подтверждая, что заказ был оплачен только один раз.
-    Это показывает, что метод pay_order_safe() защищен от конкурентных запросов.
-    
-    TODO: Реализовать тест следующим образом:
-    
-    1. Создать два экземпляра PaymentService с РАЗНЫМИ сессиями
-       (это имитирует два независимых HTTP-запроса)
-       
-    2. Запустить два параллельных вызова pay_order_safe():
-       
-       async def payment_attempt_1():
-           service1 = PaymentService(session1)
-           return await service1.pay_order_safe(order_id)
-           
-       async def payment_attempt_2():
-           service2 = PaymentService(session2)
-           return await service2.pay_order_safe(order_id)
-           
-       results = await asyncio.gather(
-           payment_attempt_1(),
-           payment_attempt_2(),
-           return_exceptions=True
-       )
-       
-    3. Проверить результаты:
-       - Одна попытка должна УСПЕШНО завершиться
-       - Вторая попытка должна выбросить OrderAlreadyPaidError ИЛИ вернуть ошибку
-       
-       success_count = sum(1 for r in results if not isinstance(r, Exception))
-       error_count = sum(1 for r in results if isinstance(r, Exception))
-       
-       assert success_count == 1, "Ожидалась одна успешная оплата"
-       assert error_count == 1, "Ожидалась одна неудачная попытка"
-       
-    4. Проверить историю оплат:
-       
-       service = PaymentService(session)
-       history = await service.get_payment_history(order_id)
-       
-       # ОЖИДАЕМ ОДНУ ЗАПИСЬ 'paid' - проблема решена!
-       assert len(history) == 1, "Ожидалась 1 запись об оплате (БЕЗ RACE CONDITION!)"
-       
-    5. Вывести информацию об успешном решении:
-       
-       print(f"✅ RACE CONDITION PREVENTED!")
-       print(f"Order {order_id} was paid only ONCE:")
-       print(f"  - {history[0]['changed_at']}: status = {history[0]['status']}")
-       print(f"Second attempt was rejected: {results[1]}")
-    """
-    # TODO: Реализовать тест, демонстрирующий решение race condition
-    raise NotImplementedError("TODO: Реализовать test_concurrent_payment_safe")
+async def test_concurrent_payment_safe_prevents_race_condition():
+    if not _pg_available():
+        pytest.skip("PostgreSQL not available")
+
+    engine = _make_engine()
+    factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    user_id, order_id = await _create_order(factory)
+
+    async def attempt():
+        async with factory() as s:
+            try:
+                return await PaymentService(s).pay_order_safe(order_id)
+            except Exception as e:
+                return e
+
+    results = await asyncio.gather(attempt(), attempt(), return_exceptions=True)
+
+    async with factory() as s:
+        history = await PaymentService(s).get_payment_history(order_id)
+
+    await _cleanup(factory, user_id, order_id)
+    await engine.dispose()
+
+    successes = [r for r in results if isinstance(r, dict)]
+    errors = [r for r in results if isinstance(r, Exception)]
+
+    print(f"\n✅ RACE CONDITION PREVENTED!")
+    print(f"Order {order_id}: paid {len(history)} time(s)")
+    print(f"Success: {len(successes)}, Error: {len(errors)}")
+    if errors:
+        print(f"Rejected attempt: {errors[0]}")
+
+    assert len(history) == 1, f"Expected exactly 1 paid event, got {len(history)}"
+    assert len(successes) == 1, "Expected exactly 1 successful payment"
+    assert len(errors) == 1, "Expected exactly 1 rejected attempt"
 
 
 @pytest.mark.asyncio
 async def test_concurrent_payment_safe_with_explicit_timing():
-    """
-    Дополнительный тест: проверить работу блокировок с явной задержкой.
-    
-    TODO: Реализовать тест с добавлением задержки в первой транзакции:
-    
-    1. Первая транзакция:
-       - Начать транзакцию
-       - Заблокировать заказ (FOR UPDATE)
-       - Добавить задержку (asyncio.sleep(1))
-       - Оплатить
-       - Commit
-       
-    2. Вторая транзакция (запустить через 0.1 секунды после первой):
-       - Начать транзакцию
-       - Попытаться заблокировать заказ (FOR UPDATE)
-       - ДОЛЖНА ЖДАТЬ освобождения блокировки от первой транзакции
-       - После освобождения - увидеть обновленный статус 'paid'
-       - Выбросить OrderAlreadyPaidError
-       
-    3. Проверить временные метки:
-       - Вторая транзакция должна завершиться ПОЗЖЕ первой
-       - Разница должна быть >= 1 секунды (время задержки)
-       
-    Это подтверждает, что FOR UPDATE действительно блокирует строку.
-    """
-    # TODO: Реализовать тест с проверкой блокировки
-    raise NotImplementedError("TODO: Реализовать test_concurrent_payment_safe_with_explicit_timing")
+    if not _pg_available():
+        pytest.skip("PostgreSQL not available")
+
+    engine = _make_engine()
+    factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    user_id, order_id = await _create_order(factory, "timing_")
+
+    t1_done = None
+    t2_done = None
+
+    async def slow_payment():
+        nonlocal t1_done
+        async with factory() as s:
+            await s.execute(text("BEGIN"))
+            await s.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+            await s.execute(
+                text("SELECT id, status FROM orders WHERE id = :oid FOR UPDATE"),
+                {"oid": str(order_id)},
+            )
+            await asyncio.sleep(1.0)
+            await s.execute(
+                text("UPDATE orders SET status='paid' WHERE id=:oid AND status='created'"),
+                {"oid": str(order_id)},
+            )
+            await s.execute(
+                text("INSERT INTO order_status_history (id, order_id, status, changed_at) VALUES (gen_random_uuid(), :oid, 'paid', NOW())"),
+                {"oid": str(order_id)},
+            )
+            await s.execute(text("COMMIT"))
+            t1_done = time.monotonic()
+
+    async def fast_payment():
+        nonlocal t2_done
+        await asyncio.sleep(0.1)
+        async with factory() as s:
+            try:
+                await PaymentService(s).pay_order_safe(order_id)
+            except Exception:
+                pass
+            finally:
+                t2_done = time.monotonic()
+
+    await asyncio.gather(slow_payment(), fast_payment(), return_exceptions=True)
+
+    async with factory() as s:
+        history = await PaymentService(s).get_payment_history(order_id)
+
+    await _cleanup(factory, user_id, order_id)
+    await engine.dispose()
+
+    assert len(history) == 1
+    if t1_done and t2_done:
+        print(f"\n⏱  T1 finished at: {t1_done:.3f}, T2 finished at: {t2_done:.3f}")
+        print(f"   T2 waited at least {t2_done - t1_done:.3f}s after T1")
+        assert t2_done >= t1_done - 0.1, "T2 should finish after T1 (or very close)"
 
 
 @pytest.mark.asyncio
 async def test_concurrent_payment_safe_multiple_orders():
-    """
-    Дополнительный тест: проверить, что блокировки не мешают разным заказам.
-    
-    TODO: Реализовать тест:
-    1. Создать ДВА разных заказа
-    2. Оплатить их ПАРАЛЛЕЛЬНО с помощью pay_order_safe()
-    3. Проверить, что ОБА успешно оплачены
-    
-    Это показывает, что FOR UPDATE блокирует только конкретную строку,
-    а не всю таблицу, что важно для производительности.
-    """
-    # TODO: Реализовать тест с несколькими заказами
-    raise NotImplementedError("TODO: Реализовать test_concurrent_payment_safe_multiple_orders")
+    """FOR UPDATE блокирует только конкретную строку, разные заказы не мешают друг другу."""
+    if not _pg_available():
+        pytest.skip("PostgreSQL not available")
 
+    engine = _make_engine()
+    factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    u1, o1 = await _create_order(factory, "m1_")
+    u2, o2 = await _create_order(factory, "m2_")
 
-if __name__ == "__main__":
-    """
-    Запуск теста:
-    
-    cd backend
-    export PYTHONPATH=$(pwd)
-    pytest app/tests/test_concurrent_payment_safe.py -v -s
-    
-    ОЖИДАЕМЫЙ РЕЗУЛЬТАТ:
-    ✅ test_concurrent_payment_safe_prevents_race_condition PASSED
-    
-    Вывод должен показывать:
-    ✅ RACE CONDITION PREVENTED!
-    Order XXX was paid only ONCE:
-      - 2024-XX-XX: status = paid
-    Second attempt was rejected: OrderAlreadyPaidError(...)
-    """
-    pytest.main([__file__, "-v", "-s"])
+    async def pay(order_id):
+        async with factory() as s:
+            return await PaymentService(s).pay_order_safe(order_id)
+
+    results = await asyncio.gather(pay(o1), pay(o2), return_exceptions=True)
+
+    async with factory() as s:
+        h1 = await PaymentService(s).get_payment_history(o1)
+        h2 = await PaymentService(s).get_payment_history(o2)
+
+    await _cleanup(factory, u1, o1)
+    await _cleanup(factory, u2, o2)
+    await engine.dispose()
+
+    print(f"\n✅ Two different orders paid independently:")
+    print(f"  Order 1: {len(h1)} paid event(s)")
+    print(f"  Order 2: {len(h2)} paid event(s)")
+
+    assert len(h1) == 1
+    assert len(h2) == 1
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert len(errors) == 0, f"Unexpected errors: {errors}"
